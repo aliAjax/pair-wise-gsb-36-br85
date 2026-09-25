@@ -21,11 +21,23 @@ python app.py --port 8007
 - `POST /api/transfers`：发起转让；待审批金额立即预占，避免同一额度被重复转卖。
 - `POST /api/transfers/{id}/approve|reject`：审核；发起人不能审批自己的记录。
 - `POST /api/usage`：按计量事件登记实际取水，同一账户同一事件编号只会入账一次。
-- `GET /api/accounts/{id}/available`：查看扣减实际用量和待审批预占后的可用额度。
+- `POST /api/carryover/batches`：年度切换，为一组账户生成结转批次。先扣已用水量和当年待审批转出量，最多把许可额度两成带入下一年结转池，其余作废；同一账户同一年不能结转第二次，重复账户会跳过并指出原批次编号。
+- `GET /api/carryover/batches`：历史批次及每个账户结转前后的快照明细。
+- `GET /api/accounts/{id}/annual-balance?year=2027`：账户某年的当年许可、结转池、可转让额度和可取水合计。
+- `GET /api/carryover/pools?year=2027`：年度台账列表。
 - `GET /api/drought/simulate?supply=1000&reduction=0.3`：按高优先级先行分配，同级账户按剩余额度比例分配。
 - `GET /api/audit`：完整操作审计。
 
 余额计算和审批使用 `BEGIN IMMEDIATE`，把余额判断与写入放在同一事务中；因此并发提交不会绕过额度检查。最小留存比例按转出账户的当前许可额度计算。
+
+### 年度结转规则
+
+结转计算与存储、页面分离：纯算术在 `carryover.py`（`plan_carryover`、`draw_water`、`transfer_capacity`），不接触数据库或 HTTP；`app.py` 负责 SQLite 事务，`static/index.html` 负责按账户展示结转前后明细。
+
+- 结转结余 = `max(0, 许可额度 − 当年已用水量 − 当年待审批转出量)`；结转量 = `min(结余, 许可额度 × 20%)`，其余作废。
+- 下一年取水先扣当年许可额度，不足再动结转池（`carryover_draws` 记录每笔的拆分，计量事件按账户+年份幂等）。
+- 转让只认当年许可额度，结转池水量不能转让；已结转年度批准转让时，额度移动只作用于年度台账的许可列。
+- 结转批次写入快照（许可、已用、待批、上限、结转、作废），重复账户在响应 `skipped` 中给出 `original_batch_id`；全部重复时返回 409。
 
 ## 测试
 
@@ -33,4 +45,4 @@ python app.py --port 8007
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖转让审批与实际计量、重复计量事件、季节/最小留存规则、预占导致余额不足和发起人自审冲突。
+测试覆盖转让审批与实际计量、重复计量事件、季节/最小留存规则、预占导致余额不足和发起人自审冲突；以及结转两成上限与作废、待批转出扣减、重复批次指出原批次、下一年先当年后结转池取水、转让不认结转水量。

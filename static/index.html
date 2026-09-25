@@ -1,11 +1,24 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>水资源权配置</title>
-<style>body{font:15px/1.5 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 18px}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}small{color:#667}button{cursor:pointer}</style></head>
+<style>body{font:15px/1.5 system-ui,sans-serif;max-width:980px;margin:32px auto;padding:0 18px}input,select,button{padding:7px;margin:3px}.card{border:1px solid #d9e1e8;border-radius:10px;padding:16px;margin:16px 0}pre{background:#f5f7f9;padding:12px;overflow:auto}small{color:#667}button{cursor:pointer}table{border-collapse:collapse;width:100%;margin:8px 0;font-size:13px}th,td{border:1px solid #d9e1e8;padding:5px 8px;text-align:right}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2){text-align:left}.warn{color:#a15c00;background:#fff6e5;border:1px solid #f0d3a0;border-radius:8px;padding:8px;margin:8px 0}.err{color:#8a1f1f;background:#fdeeee;border:1px solid #f0b0b0;border-radius:8px;padding:8px;margin:8px 0}.tag{font-size:12px;color:#0a5d2a}</style></head>
 <body><h1>跨区域水资源使用权</h1><p>示例账户初始化后，可查看余额、发起转让、审核，并模拟干旱分配。</p>
 <div class="card"><h2>身份</h2><input id="user" value="alice"><select id="role"><option>editor</option><option>reviewer</option><option>meter</option><option>viewer</option></select></div>
 <div class="card"><h2>账户</h2><button onclick="getAccounts()">刷新账户</button><pre id="accounts">等待操作…</pre></div>
 <div class="card"><h2>发起转让</h2><input id="from" type="number" value="1" placeholder="转出账户"><input id="to" type="number" value="2" placeholder="转入账户"><input id="amount" type="number" value="400"><input id="date" type="date" value="2026-06-01"><button onclick="transfer()">提交审批</button><pre id="result"></pre></div>
 <div class="card"><h2>审批最新转让</h2><input id="transfer_id" type="number" placeholder="转让 ID"><button onclick="approve()">批准</button><button onclick="reject()">退回</button></div>
+<div class="card"><h2>年度结转批次</h2>
+<p><small>先扣已用水量和待审批转出量，最多带走许可额度两成，其余作废；同一账户同一年只能结转一次。</small></p>
+年份 <input id="cy_year" type="number" value="2026" style="width:90px">
+账户编号（逗号分隔） <input id="cy_ids" value="1,2" style="width:160px">
+备注 <input id="cy_note" placeholder="年度切换" style="width:140px">
+<button onclick="carryover()">生成结转批次</button>
+<button onclick="listBatches()">查看历史批次</button>
+<div id="carry_result"></div></div>
+<div class="card"><h2>账户年度明细</h2>
+账户 <input id="bal_acct" type="number" value="1" style="width:80px">
+年份 <input id="bal_year" type="number" value="2027" style="width:90px">
+<button onclick="balance()">查看结转前后明细</button>
+<div id="balance_result"></div></div>
 <div class="card"><h2>干旱情景</h2><input id="supply" type="number" value="1200"><input id="reduction" type="number" value="0.3" step="0.1"><button onclick="simulate()">模拟</button><pre id="drought">等待操作…</pre></div>
 <script>
 const headers=()=>({'Content-Type':'application/json','X-User':user.value,'X-Role':role.value});
@@ -15,4 +28,46 @@ async function transfer(){try{result.textContent=JSON.stringify(await call('/api
 async function approve(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/approve',{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){result.textContent=e.message}}
 async function reject(){try{result.textContent=JSON.stringify(await call('/api/transfers/'+transfer_id.value+'/reject',{method:'POST',headers:headers(),body:'{}'}),null,2)}catch(e){result.textContent=e.message}}
 async function simulate(){try{drought.textContent=JSON.stringify(await call('/api/drought/simulate?supply='+supply.value+'&reduction='+reduction.value),null,2)}catch(e){drought.textContent=e.message}}
+const fmt=n=>(Math.round(n*1000)/1000);
+function skippedBox(skipped){if(!skipped||!skipped.length)return'';return '<div class="warn">重复账户已跳过（同一年不能结转第二次）：<ul>'+skipped.map(s=>`<li>账户 ${s.account_id} ${s.name??''}：原批次 <b>#${s.original_batch_id}</b></li>`).join('')+'</ul></div>';}
+function entryTable(entries){return '<table><tr><th>账户</th><th>许可额度</th><th>已用水</th><th>待批转出</th><th>结余</th><th>两成上限</th><th>结转下年</th><th>作废</th></tr>'+
+entries.map(e=>`<tr><td>${e.name}</td><td>${fmt(e.quota)}</td><td>${fmt(e.used)}</td><td>${fmt(e.pending_out)}</td><td>${fmt(e.unused)}</td><td>${fmt(e.cap)}</td><td><b>${fmt(e.carry)}</b>${e.capped?' <span class="tag">触顶</span>':''}</td><td>${fmt(e.void)}</td></tr>`).join('')+'</table>';}
+async function carryover(){
+  const ids=cy_ids.value.split(',').map(s=>+s).filter(Boolean);
+  const box=document.getElementById('carry_result');
+  try{
+    const j=await call('/api/carryover/batches',{method:'POST',headers:headers(),body:JSON.stringify({year:+cy_year.value,account_ids:ids,note:cy_note.value})});
+    box.innerHTML=`<div class="tag">批次 #${j.batch_id}：${j.year} 年 → ${j.to_year} 年结转池</div>`+skippedBox(j.skipped)+entryTable(j.entries);
+  }catch(e){
+    const skipped=(e.skipped||[]);let html=`<div class="err">${e.message}</div>`;
+    if(skipped.length)html+=skippedBox(skipped);
+    box.innerHTML=html;
+  }
+}
+async function listBatches(){
+  const box=document.getElementById('carry_result');
+  try{
+    const j=await call('/api/carryover/batches');
+    if(!j.batches.length){box.innerHTML='<p>还没有结转批次。</p>';return;}
+    box.innerHTML=j.batches.map(b=>`<div class="card"><b>批次 #${b.id}</b>（${b.year} 年，${b.created_by}，${b.created_at}）${b.note?(' 备注：'+b.note):''}`+
+      '<table><tr><th>账户</th><th>结转前：许可/已用/待批/结余</th><th>上限</th><th>结转</th><th>作废</th></tr>'+
+      b.entries.map(e=>`<tr><td>${e.account_name}</td><td>${fmt(e.quota_snapshot)} / ${fmt(e.used_snapshot)} / ${fmt(e.pending_snapshot)} / ${fmt(e.unused)}</td><td>${fmt(e.cap)}</td><td><b>${fmt(e.carry)}</b></td><td>${fmt(e.void)}</td></tr>`).join('')+
+      '</table></div>').join('');
+  }catch(e){box.innerHTML=`<div class="err">${e.message}</div>`;}
+}
+async function balance(){
+  const box=document.getElementById('balance_result');
+  try{
+    const j=await call(`/api/accounts/${+bal_acct.value}/annual-balance?year=${+bal_year.value}`);
+    const src=j.carried_from_batch?`（来自批次 #${j.carried_from_batch.batch_id}）`:'';
+    box.innerHTML=`<table>
+      <tr><th>账户 / 年份</th><td>${j.name} / ${j.year}</td></tr>
+      <tr><th>当年许可额度</th><td>${fmt(j.permit_quota)}（已用 ${fmt(j.annual_used)}，剩余 <b>${fmt(j.annual_remaining)}</b>）</td></tr>
+      <tr><th>结转池</th><td>${fmt(j.pool_in)}${src}（已用 ${fmt(j.pool_used)}，剩余 <b>${fmt(j.pool_remaining)}</b>）</td></tr>
+      <tr><th>待审批转出</th><td>${fmt(j.pending_out)}</td></tr>
+      <tr><th>可转让额度</th><td>${fmt(j.transferable)} <small>（不认结转水量）</small></td></tr>
+      <tr><th>可取水合计</th><td><b>${fmt(j.available_total)}</b> <small>（先当年额度，再结转池）</small></td></tr>
+    </table>`;
+  }catch(e){box.innerHTML=`<div class="err">${e.message}</div>`;}
+}
 </script></body></html>
