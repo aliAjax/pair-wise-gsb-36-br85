@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from carryover import compute_carryover, plan_drawdown
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "water_rights.db"
 
@@ -99,6 +101,29 @@ class Database:
                     min_source_fraction REAL NOT NULL CHECK(min_source_fraction >= 0 AND min_source_fraction <= 1),
                     note TEXT NOT NULL DEFAULT '',
                     UNIQUE(source_region, target_region)
+                );
+                CREATE TABLE IF NOT EXISTS carryover_batches (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    year INTEGER NOT NULL,
+                    actor TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS carryover_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_id INTEGER NOT NULL REFERENCES carryover_batches(id),
+                    account_id INTEGER NOT NULL REFERENCES accounts(id),
+                    year INTEGER NOT NULL,
+                    quota REAL NOT NULL,
+                    used REAL NOT NULL,
+                    reserved REAL NOT NULL,
+                    unused REAL NOT NULL,
+                    cap REAL NOT NULL,
+                    carried REAL NOT NULL,
+                    forfeited REAL NOT NULL,
+                    remaining REAL NOT NULL CHECK(remaining >= 0),
+                    created_at TEXT NOT NULL,
+                    UNIQUE(account_id, year)
                 );
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -191,12 +216,20 @@ class Database:
 
     def available(self, account_id: int, as_of: str | None = None) -> dict[str, Any]:
         if as_of:
-            parse_date(as_of, "查询日期")
+            ref_year = parse_date(as_of, "查询日期").year
+        else:
+            ref_year = datetime.now(timezone.utc).year
         with self.connect() as conn:
             account = self._account_row(conn, account_id)
             reserved = self._reserved_outgoing(conn, account_id)
             value = max(0.0, float(account["quota"]) - float(account["used"]) - reserved)
-        return {"account_id": account_id, "available": value, "reserved_outgoing": reserved, "quota": account["quota"], "used": account["used"]}
+            pool = conn.execute(
+                "SELECT COALESCE(SUM(remaining),0) total FROM carryover_entries WHERE account_id=? AND year+1=?",
+                (account_id, ref_year),
+            ).fetchone()["total"]
+        return {"account_id": account_id, "available": value, "reserved_outgoing": reserved,
+                "quota": account["quota"], "used": account["used"],
+                "carryover_pool": float(pool), "carryover_pool_year": ref_year}
 
     def create_transfer(self, actor: str, payload: dict[str, Any], role: str = "editor") -> dict[str, Any]:
         if role != "editor":
@@ -219,6 +252,7 @@ class Database:
             if not (target["valid_from"] <= effective.isoformat() <= target["valid_to"]):
                 raise DomainError("转入账户在生效日无效", 409)
             reserved = self._reserved_outgoing(conn, source_id)
+            # 转让只认当年额度（quota-used-reserved），不认结转池水量。
             available = float(source["quota"]) - float(source["used"]) - reserved
             if amount > available + 1e-9:
                 raise DomainError("可用额度不足，待审批转让会预占额度", 409)
@@ -298,6 +332,110 @@ class Database:
             self._audit(conn, actor, "transfer.rejected", "transfer", transfer_id, {})
         return {"id": transfer_id, "status": "rejected"}
 
+    # --- 年度结转：存储（计算逻辑在 carryover.py，页面在 static/index.html） ---
+
+    def create_carryover_batch(self, actor: str, payload: dict[str, Any], role: str = "editor") -> dict[str, Any]:
+        if role != "editor":
+            raise DomainError("只有配额管理员可以生成结转批次", 403)
+        try:
+            year = int(payload.get("year"))
+        except (TypeError, ValueError) as exc:
+            raise DomainError("结转年份必须是整数") from exc
+        if not 2000 <= year <= 2100:
+            raise DomainError("结转年份不在合理范围内")
+        note = str(payload.get("note", "")).strip()
+        raw_ids = payload.get("account_ids")
+        account_ids: list[int] = []
+        if raw_ids not in (None, "", []):
+            if not isinstance(raw_ids, (list, tuple)):
+                raise DomainError("account_ids 必须是账户编号数组")
+            for value in raw_ids:
+                try:
+                    account_id = int(value)
+                except (TypeError, ValueError) as exc:
+                    raise DomainError("账户编号必须是数值") from exc
+                if account_id not in account_ids:
+                    account_ids.append(account_id)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if account_ids:
+                accounts = [self._account_row(conn, account_id) for account_id in account_ids]
+            else:
+                accounts = conn.execute("SELECT * FROM accounts ORDER BY id").fetchall()
+            if not accounts:
+                raise DomainError("没有可结转的账户")
+            # 同一账户同一年只能结转一次；重复时指出原批次，整个批次不落库。
+            for account in accounts:
+                dup = conn.execute(
+                    "SELECT batch_id FROM carryover_entries WHERE account_id=? AND year=?",
+                    (account["id"], year),
+                ).fetchone()
+                if dup:
+                    raise DomainError(
+                        f"账户 {account['name']} 在 {year} 年已生成结转（原批次 #{dup['batch_id']}），不能重复生成", 409)
+            cur = conn.execute(
+                "INSERT INTO carryover_batches(year,actor,note,created_at) VALUES(?,?,?,?)",
+                (year, actor, note, utcnow()),
+            )
+            batch_id = int(cur.lastrowid)
+            entries: list[dict[str, Any]] = []
+            for account in accounts:
+                reserved = self._reserved_outgoing(conn, int(account["id"]))
+                calc = compute_carryover(account["quota"], account["used"], reserved)
+                conn.execute(
+                    """INSERT INTO carryover_entries(batch_id,account_id,year,quota,used,reserved,unused,cap,carried,forfeited,remaining,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (batch_id, account["id"], year, account["quota"], account["used"], reserved,
+                     calc["unused"], calc["cap"], calc["carried"], calc["forfeited"], calc["carried"], utcnow()),
+                )
+                entries.append({"account_id": int(account["id"]), "account_name": account["name"],
+                                "quota": float(account["quota"]), "used": float(account["used"]),
+                                "reserved": reserved, **calc, "remaining": calc["carried"]})
+            self._audit(conn, actor, "carryover.batch_created", "carryover_batch", batch_id,
+                        {"year": year, "accounts": [e["account_id"] for e in entries],
+                         "carried": sum(e["carried"] for e in entries),
+                         "forfeited": sum(e["forfeited"] for e in entries)})
+            batch = dict(conn.execute("SELECT * FROM carryover_batches WHERE id=?", (batch_id,)).fetchone())
+        return {"batch": batch, "entries": entries}
+
+    def _carryover_entries(self, conn: sqlite3.Connection, batch_id: int) -> list[dict[str, Any]]:
+        rows = conn.execute(
+            """SELECT ce.*, a.name AS account_name FROM carryover_entries ce
+               JOIN accounts a ON a.id=ce.account_id WHERE ce.batch_id=? ORDER BY ce.id""",
+            (batch_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_carryover_batches(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            batches = [dict(row) for row in conn.execute("SELECT * FROM carryover_batches ORDER BY id DESC").fetchall()]
+            for batch in batches:
+                batch["entries"] = self._carryover_entries(conn, int(batch["id"]))
+        return batches
+
+    def get_carryover_batch(self, batch_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM carryover_batches WHERE id=?", (batch_id,)).fetchone()
+            if not row:
+                raise DomainError("结转批次不存在", 404)
+            batch = dict(row)
+            entries = self._carryover_entries(conn, batch_id)
+        return {"batch": batch, "entries": entries}
+
+    def account_carryover(self, account_id: int) -> dict[str, Any]:
+        with self.connect() as conn:
+            self._account_row(conn, account_id)
+            rows = conn.execute(
+                """SELECT ce.*, b.actor, b.note FROM carryover_entries ce
+                   JOIN carryover_batches b ON b.id=ce.batch_id
+                   WHERE ce.account_id=? ORDER BY ce.year""",
+                (account_id,),
+            ).fetchall()
+        entries = [dict(row) for row in rows]
+        return {"account_id": account_id,
+                "carryover_pool": sum(float(e["remaining"]) for e in entries),
+                "entries": entries}
+
     def record_usage(self, actor: str, payload: dict[str, Any], role: str = "meter") -> dict[str, Any]:
         if role not in {"meter", "editor"}:
             raise DomainError("只有计量员可以登记取水", 403)
@@ -316,9 +454,15 @@ class Database:
             if not (account["valid_from"] <= occurred.isoformat() <= account["valid_to"]):
                 raise DomainError("取水日期不在许可有效期内", 409)
             reserved = self._reserved_outgoing(conn, account_id)
-            available = float(account["quota"]) - float(account["used"]) - reserved
-            if amount > available + 1e-9:
-                raise DomainError("取水超过可用额度", 409)
+            current_available = float(account["quota"]) - float(account["used"]) - reserved
+            # 结转池水量只在水源年份的下一年可用；取水先扣当年额度，再动结转池。
+            pools = conn.execute(
+                "SELECT id, remaining FROM carryover_entries WHERE account_id=? AND remaining>0 AND year+1=? ORDER BY year,id",
+                (account_id, occurred.year),
+            ).fetchall()
+            pool_total = sum(float(pool["remaining"]) for pool in pools)
+            if amount > current_available + pool_total + 1e-9:
+                raise DomainError("取水超过可用额度（当年额度与结转池合计不足）", 409)
             season = conn.execute("SELECT max_fraction FROM season_rules WHERE region=? AND month=?", (account["region"], occurred.month)).fetchone()
             month_total = conn.execute(
                 "SELECT COALESCE(SUM(amount),0) total FROM usage_records WHERE account_id=? AND substr(occurred_at,1,7)=?",
@@ -335,11 +479,19 @@ class Database:
                 )
             except sqlite3.IntegrityError as exc:
                 raise DomainError("计量事件已登记，不能重复计水", 409) from exc
-            conn.execute("UPDATE accounts SET used=used+? WHERE id=?", (amount, account_id))
+            from_current, pool_draws = plan_drawdown(amount, current_available, pools)
+            # used 只记当年额度的消耗，结转池的消耗扣在条目 remaining 上。
+            conn.execute("UPDATE accounts SET used=used+? WHERE id=?", (from_current, account_id))
+            for entry_id, drawn in pool_draws:
+                conn.execute("UPDATE carryover_entries SET remaining=remaining-? WHERE id=?", (drawn, entry_id))
             self._audit(conn, actor, "usage.recorded", "account", account_id,
-                        {"amount": amount, "occurred_at": occurred.isoformat(), "meter_event_id": meter_event_id})
+                        {"amount": amount, "occurred_at": occurred.isoformat(), "meter_event_id": meter_event_id,
+                         "from_current_quota": from_current, "from_carryover_pool": amount - from_current})
             row = conn.execute("SELECT * FROM usage_records WHERE id=?", (cur.lastrowid,)).fetchone()
-        return dict(row)
+        result = dict(row)
+        result["from_current_quota"] = from_current
+        result["from_carryover_pool"] = amount - from_current
+        return result
 
     def simulate_drought(self, total_supply: float, reduction: float = 0.0, role: str = "viewer") -> dict[str, Any]:
         try:
@@ -391,6 +543,10 @@ class Database:
             for row in rows:
                 item = dict(row)
                 item["available"] = max(0.0, float(row["quota"]) - float(row["used"]) - self._reserved_outgoing(conn, int(row["id"])))
+                item["carryover_pool"] = float(conn.execute(
+                    "SELECT COALESCE(SUM(remaining),0) total FROM carryover_entries WHERE account_id=?",
+                    (row["id"],),
+                ).fetchone()["total"])
                 result.append(item)
         return result
 
@@ -461,9 +617,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send({"transfers": self.db.list_transfers()})
             if parsed.path == "/api/audit":
                 return self._send({"audit": self.db.audit()})
+            if parsed.path == "/api/carryover/batches":
+                return self._send({"batches": self.db.list_carryover_batches()})
+            if parsed.path.startswith("/api/carryover/batches/"):
+                return self._send(self.db.get_carryover_batch(int(parsed.path.split("/")[4])))
+            if parsed.path.startswith("/api/accounts/") and parsed.path.endswith("/carryover"):
+                account_id = int(parsed.path.split("/")[3])
+                return self._send(self.db.account_carryover(account_id))
             if parsed.path.startswith("/api/accounts/") and parsed.path.endswith("/available"):
                 account_id = int(parsed.path.split("/")[3])
-                return self._send(self.db.available(account_id))
+                as_of = parse_qs(parsed.query).get("as_of", [None])[0]
+                return self._send(self.db.available(account_id, as_of))
             if parsed.path == "/api/drought/simulate":
                 q = parse_qs(parsed.query)
                 return self._send(self.db.simulate_drought(float(q.get("supply", ["0"])[0]), float(q.get("reduction", ["0"])[0])))
@@ -489,6 +653,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(self.db.approve_transfer(int(parts[2]), actor, role))
             if len(parts) == 4 and parts[:2] == ["api", "transfers"] and parts[3] == "reject":
                 return self._send(self.db.reject_transfer(int(parts[2]), actor, role))
+            if parts == ["api", "carryover", "batches"]:
+                return self._send(self.db.create_carryover_batch(actor, body, role), 201)
             if parts == ["api", "usage"]:
                 return self._send(self.db.record_usage(actor, body, role), 201)
             raise DomainError("接口不存在", 404)
